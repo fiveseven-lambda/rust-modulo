@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "example",
+    "modulo",
+    "modulo_internals",
+]
