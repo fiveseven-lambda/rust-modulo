@@ -1,49 +1,130 @@
 use proc_macro2::TokenStream;
 use syn::parse::{Parse, ParseStream};
 
-use syn::{BinOp, Expr, Token, UnOp};
+use syn::{BinOp, Expr, Lit, Token, UnOp};
 
-struct ModuloExpr {
-    expr: Expr,
-    _delim: Token![;],
+struct Input(Expr, Converter);
+
+struct Converter {
     modulo: Expr,
+    config: Config,
 }
 
-impl Parse for ModuloExpr {
-    fn parse(input: ParseStream) -> syn::parse::Result<ModuloExpr> {
-        Ok(ModuloExpr {
-            expr: input.parse()?,
-            _delim: input.parse()?,
-            modulo: input.parse()?,
-        })
+#[derive(Default)]
+struct Config {
+    array_elem: Option<bool>,
+    assign_left: Option<bool>,
+    assign_right: Option<bool>,
+    add_assign_left: Option<bool>,
+    add_assign_right: Option<bool>,
+    sub_assign_left: Option<bool>,
+    sub_assign_right: Option<bool>,
+    mul_assign_left: Option<bool>,
+    mul_assign_right: Option<bool>,
+    div_assign_left: Option<bool>,
+    div_assign_right: Option<bool>,
+}
+
+macro_rules! configure {
+    ($self:expr; $($expr:expr => $item:ident),* $(,)?) => {
+        {
+            $(match $expr {
+                Expr::Lit(syn::ExprLit {
+                    lit: Lit::Bool(syn::LitBool { value, .. }),
+                    ..
+                }) => {
+                    assert!($self.$item.is_none());
+                    $self.$item = Some(value);
+                }
+                other => $self.configure(other),
+            })*
+        }
+    };
+}
+
+impl Config {
+    fn configure(&mut self, expr: Expr) {
+        match expr {
+            Expr::Array(expr) => {
+                for elem in expr.elems {
+                    configure!(self; elem => array_elem);
+                }
+            }
+            Expr::Assign(expr) => configure! {
+                self;
+                *expr.left => assign_left,
+                *expr.right => assign_right,
+            },
+            Expr::AssignOp(expr) => match expr.op {
+                BinOp::AddEq(_) => configure! {
+                    self;
+                    *expr.left => add_assign_left,
+                    *expr.right => add_assign_right,
+                },
+                BinOp::SubEq(_) => configure! {
+                    self;
+                    *expr.left => sub_assign_left,
+                    *expr.right => sub_assign_right,
+                },
+                BinOp::MulEq(_) => configure! {
+                    self;
+                    *expr.left => mul_assign_left,
+                    *expr.right => mul_assign_right,
+                },
+                BinOp::DivEq(_) => configure! {
+                    self;
+                    *expr.left => div_assign_left,
+                    *expr.right => div_assign_right,
+                },
+                _ => panic!(),
+            },
+            _ => todo!(),
+        }
+    }
+}
+
+impl Parse for Input {
+    fn parse(input: ParseStream) -> syn::parse::Result<Input> {
+        let expr = input.parse()?;
+        input.parse::<Token![mod]>()?;
+        let modulo = input.parse()?;
+        let mut config = Config::default();
+        if !input.is_empty() {
+            input.parse::<Token![;]>()?;
+            config.configure(input.parse()?);
+        }
+        Ok(Input(expr, Converter { modulo, config }))
     }
 }
 
 pub fn modulo(tokens: TokenStream) -> TokenStream {
     use quote::ToTokens;
-    let ModuloExpr {
-        mut expr, modulo, ..
-    } = syn::parse2(tokens).unwrap();
-    expr.convert(&modulo);
+    let Input(mut expr, converter) = syn::parse2(tokens).unwrap();
+    converter.convert(&mut expr);
     expr.to_token_stream()
 }
 
 trait Convert {
-    fn convert(&mut self, modulo: &Expr);
+    fn convert(&self, expr: &mut Expr);
 }
 
-impl Convert for Expr {
-    fn convert(&mut self, modulo: &Expr) {
-        match self {
+impl Convert for Converter {
+    fn convert(&self, expr: &mut Expr) {
+        let Converter { config, modulo } = self;
+        match expr {
             Expr::Lit(_) => {}
             Expr::Path(_) => {}
             Expr::Assign(expr) => {
-                expr.left.convert(modulo);
-                expr.right.convert(modulo);
+                if config.assign_left.unwrap_or(true) {
+                    self.convert(&mut expr.left);
+                }
+                if config.assign_right.unwrap_or(true) {
+                    self.convert(&mut expr.right);
+                }
             }
             Expr::Unary(syn::ExprUnary { expr, op, .. }) => {
-                expr.convert(modulo);
-                *self = match op {
+                self.convert(expr);
+                *expr = match op {
                     UnOp::Neg(_) => syn::parse_quote! {
                         modulo_internals::sub(0, #expr, #modulo)
                     },
@@ -53,9 +134,9 @@ impl Convert for Expr {
             Expr::Binary(syn::ExprBinary {
                 left, op, right, ..
             }) => {
-                left.convert(modulo);
-                right.convert(modulo);
-                *self = match op {
+                self.convert(left);
+                self.convert(right);
+                *expr = match op {
                     BinOp::Add(_) => syn::parse_quote! {
                         modulo_internals::add(#left, #right, #modulo)
                     },
@@ -74,27 +155,51 @@ impl Convert for Expr {
             Expr::AssignOp(syn::ExprAssignOp {
                 left, op, right, ..
             }) => {
-                left.convert(modulo);
-                right.convert(modulo);
-                *self = match op {
-                    BinOp::AddEq(_) => syn::parse_quote! {
-                        modulo_internals::add_assign(#right, &mut #left, #modulo)
-                    },
-                    BinOp::SubEq(_) => syn::parse_quote! {
-                        modulo_internals::sub_assign(#right, &mut #left, #modulo)
-                    },
-                    BinOp::MulEq(_) => syn::parse_quote! {
-                        modulo_internals::mul_assign(#right, &mut #left, #modulo)
-                    },
-                    BinOp::DivEq(_) => syn::parse_quote! {
-                        modulo_internals::div_assign(#right, &mut #left, #modulo)
-                    },
+                *expr = match op {
+                    BinOp::AddEq(_) => {
+                        if config.add_assign_left.unwrap_or(true) {
+                            self.convert(left);
+                        }
+                        if config.add_assign_right.unwrap_or(true) {
+                            self.convert(right);
+                        }
+                        syn::parse_quote!(modulo_internals::add_assign(#right, &mut #left, #modulo))
+                    }
+                    BinOp::SubEq(_) => {
+                        if config.sub_assign_left.unwrap_or(true) {
+                            self.convert(left);
+                        }
+                        if config.sub_assign_right.unwrap_or(true) {
+                            self.convert(right);
+                        }
+                        syn::parse_quote!(modulo_internals::sub_assign(#right, &mut #left, #modulo))
+                    }
+                    BinOp::MulEq(_) => {
+                        if config.mul_assign_left.unwrap_or(true) {
+                            self.convert(left);
+                        }
+                        if config.mul_assign_right.unwrap_or(true) {
+                            self.convert(right);
+                        }
+                        syn::parse_quote!(modulo_internals::mul_assign(#right, &mut #left, #modulo))
+                    }
+                    BinOp::DivEq(_) => {
+                        if config.div_assign_left.unwrap_or(true) {
+                            self.convert(left);
+                        }
+                        if config.div_assign_right.unwrap_or(true) {
+                            self.convert(right);
+                        }
+                        syn::parse_quote!(modulo_internals::div_assign(#right, &mut #left, #modulo))
+                    }
                     _ => todo!(),
                 }
             }
             Expr::Array(expr) => {
-                for elem in &mut expr.elems {
-                    elem.convert(modulo);
+                if config.array_elem.unwrap_or(true) {
+                    for elem in &mut expr.elems {
+                        self.convert(elem);
+                    }
                 }
             }
             _ => todo!(),
